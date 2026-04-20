@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "corl"
+version = "0.1.0"
+description = "CG-UFM: Consensus-Guided Unbalanced Flow Matching for Underwater 3D Reconstruction"
+readme = "README.md"
+requires-python = "==3.10.*"
+license = { text = "MIT" }
+authors = [
+    { name = "Your Name", email = "your.email@example.com" }
+]
+
+dependencies = [
+    # Core deep learning framework
+    "torch>=2.0.0",
+    "torchvision>=0.15.0",
+    "torchaudio>=2.0.0",
+
+    # Core math and physics solver
+    "torchdiffeq>=0.2.3",
+    "POT>=0.9.3",
+    "scipy>=1.10.0",
+
+    # 3D geometry processor
+    "open3d>=0.17.0",
+    "trimesh>=4.0.0",
+    "rtree>=1.1.0",
+
+    # Experiment recoder & tracker
+    "wandb>=0.16.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "black",
+    "flake8",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["models*", "core*", "data*"]
