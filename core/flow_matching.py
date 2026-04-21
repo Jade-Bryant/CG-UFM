@@ -22,58 +22,60 @@ class FlowMatchingLoss(nn.Module):
         self.reg_ot = reg_ot
 
     def compute_ot_assignment(self, x_0: torch.Tensor, x_gt: torch.Tensor):
-        """
-        Computes the unbalanced or partial optimal transport plan between x_0 and x_gt.
-        Here we use POT's exact EMD or Sinkhorn for batch processing.
-        
-        Args:
-            x_0: Source points, shape (B, M, 3)
-            x_gt: Target points, shape (B, K, 3)
+            """
+            Computes the unbalanced optimal transport plan directly on GPU using PyTorch backend.
+            Uses Barycentric projection to find the exact target coordinate and marginal mass for survival.
+            """
+            B, M, _ = x_0.shape
+            _, K, _ = x_gt.shape
+            device = x_0.device
             
-        Returns:
-            matched_x_gt: The target points aligned to x_0, shape (B, M, 3)
-            survival_target: Binary mask indicating if an x_0 point is successfully matched (1) or should die (0), shape (B, M, 1)
-        """
-        B, M, _ = x_0.shape
-        _, K, _ = x_gt.shape
-        device = x_0.device
-        
-        matched_x_gt = torch.zeros_like(x_0)
-        survival_target = torch.zeros((B, M, 1), device=device)
-        
-        # OT is typically solved per sample in the batch
-        for b in range(B):
-            source = x_0[b].detach().cpu().numpy()
-            target = x_gt[b].detach().cpu().numpy()
+            matched_x_gt = torch.zeros_like(x_0)
+            survival_target = torch.zeros((B, M, 1), device=device)
             
-            # Compute cost matrix (squared Euclidean distance)
-            M_cost = ot.dist(source, target, metric='sqeuclidean')
-            M_cost = M_cost / M_cost.max() # Normalize cost matrix for numerical stability
+            # UOT Hyperparameters (Can be moved to __init__ later for tuning)
+            reg_entropy = self.reg_ot  # Entropy regularization (e.g., 0.05)
+            reg_mass = 0.5             # Mass relaxation term (Controls how easily points can "die")
             
-            # Uniform mass distribution
-            a, b_mass = np.ones((M,)) / M, np.ones((K,)) / K
-            
-            # Use exact Earth Mover's Distance (EMD) assignment 
-            # (or use ot.sinkhorn for differentiable/faster approx)
-            # Since this is unbalanced (M != K), we use Partial OT or relax the mass conservation.
-            # For simplicity in this scaffold, we find the nearest neighbor in GT for each x_0
-            # weighted by the OT plan.
-            # Real implementation might use `ot.partial.partial_wasserstein` or similar.
-            pi = ot.emd(a, b_mass, M_cost)
-            
-            # From the transport plan pi (M x K), find the most probable target for each source
-            # If the max probability is below a threshold, we consider it "dead" (noise)
-            max_prob_indices = np.argmax(pi, axis=1)
-            max_probs = np.max(pi, axis=1)
-            
-            # Threshold to determine survival (heuristic for unbalanced matching)
-            survival_threshold = 1e-5
-            is_survived = max_probs > survival_threshold
-            
-            matched_x_gt[b] = x_gt[b, max_prob_indices]
-            survival_target[b, is_survived, 0] = 1.0
+            for b in range(B):
+                source = x_0[b].detach() # (M, 3)
+                target = x_gt[b].detach() # (K, 3)
+                
+                # 1. Compute squared Euclidean distance matrix on GPU
+                # Using torch.cdist for fast batched distance computation
+                M_cost = torch.cdist(source.unsqueeze(0), target.unsqueeze(0), p=2).squeeze(0) ** 2
+                
+                # Normalize cost for numerical stability in Sinkhorn
+                cost_max = M_cost.max() + 1e-8
+                M_cost_norm = M_cost / cost_max
+                
+                # 2. Uniform initial mass distribution (Tensors on GPU)
+                a = torch.ones(M, device=device, dtype=torch.float32) / M
+                b_mass = torch.ones(K, device=device, dtype=torch.float32) / K
+                
+                # 3. Unbalanced Sinkhorn directly on PyTorch tensors
+                # pi shape: (M, K)
+                pi = ot.unbalanced.sinkhorn_unbalanced(
+                    a, b_mass, M_cost_norm, 
+                    reg=reg_entropy, reg_m=reg_mass, 
+                    numItermax=1000, stopThr=1e-5
+                )
+                
+                # 4. Extract survival probability from marginals
+                # The sum of transported mass from each source point represents its survival score.
+                # We normalize it by the initial mass (1/M) so the max score approaches 1.0.
+                surviving_mass = pi.sum(dim=1) # (M,)
+                survival_score = torch.clamp(surviving_mass / (1.0 / M), min=0.0, max=1.0)
+                
+                # 5. Barycentric projection to find the continuous target coordinate
+                # Instead of a hard Nearest Neighbor, we blend target coordinates based on the OT plan.
+                # Add epsilon to prevent division by zero for completely dead points.
+                matched_coords = torch.matmul(pi, target) / (surviving_mass.unsqueeze(1) + 1e-8)
+                
+                matched_x_gt[b] = matched_coords
+                survival_target[b, :, 0] = survival_score
 
-        return matched_x_gt, survival_target
+            return matched_x_gt, survival_target
 
     def forward(self, 
                 x_0: torch.Tensor, 

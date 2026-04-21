@@ -66,3 +66,47 @@ class CG_UFM_Network(nn.Module):
         survival_logit = self.survival_head(backbone_features)
         
         return velocity, survival_logit
+
+class CG_UFM_ODEWrapper(nn.Module):
+    """
+    The mathematical wrapper that strictly conforms to torchdiffeq's `odeint` signature.
+    It encapsulates the static condition `c` and couples (position, mass) into a 4D state.
+    """
+    def __init__(self, net: CG_UFM_Network, condition_c: torch.Tensor):
+        super().__init__()
+        self.net = net
+        self.c = condition_c # Static consensus embedding (B, M, d)
+
+    def forward(self, t: torch.Tensor, state_4d: torch.Tensor):
+        """
+        Signature required by torchdiffeq: f(t, y) -> dy/dt
+        
+        Args:
+            t: Current time scalar or 1D tensor
+            state_4d: The coupled state [x_t, m_t], shape (B, M, 4)
+            
+        Returns:
+            dstate_dt: The coupled derivative [dx_t/dt, dm_t/dt], shape (B, M, 4)
+        """
+        # torchdiffeq often passes `t` as a 0D scalar. We format it to (B, 1) for the network.
+        B, M, _ = state_4d.shape
+        if t.dim() == 0:
+            t_batch = t.expand(B, 1).to(state_4d.device)
+        elif t.dim() == 1:
+            t_batch = t.unsqueeze(1).to(state_4d.device)
+        else:
+            t_batch = t
+            
+        # Uncouple the 4D state back into 3D position and 1D mass
+        x_t = state_4d[..., :3]  # (B, M, 3)
+        # m_t = state_4d[..., 3:] # (B, M, 1) -> Mass is tracked but not input to this specific backbone
+        
+        # Forward pass through the core network
+        # velocity is dx/dt, survival_rate is dm/dt
+        velocity, survival_rate = self.net(x_t, t_batch, self.c)
+        
+        # Recouple the derivatives into 4D
+        dstate_dt = torch.cat([velocity, survival_rate], dim=-1) # (B, M, 4)
+        
+        return dstate_dt
+        
