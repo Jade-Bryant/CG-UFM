@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from .backbones.pointnet2 import SimplePointNet, SinusoidalTimeEmbedding
+from .backbones.pointnet2 import PointNet2, SinusoidalTimeEmbedding
 from .modules.consensus import ConsensusMLP
 from .modules.densify import Densifier
 
@@ -26,7 +26,7 @@ class CG_UFM_Network(nn.Module):
         
         # Backbone input dimension: 3 (xyz) + c_dim (consensus) + time_emb_dim
         in_dim = 3 + c_dim + time_emb_dim
-        self.backbone = SimplePointNet(in_dim=in_dim, out_dim=backbone_dim)
+        self.backbone = PointNet2(in_dim=in_dim, out_dim=backbone_dim)
         
         # Dual-Head ODE Outputs
         # 1. Spatial Velocity v_t

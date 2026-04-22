@@ -46,7 +46,7 @@ def main():
     # 3. Simulate Sliding Window Inference
     # In a real scenario, you'd extract patches iteratively
     # Here we just infer a dummy patch
-    dataset = UnderwaterPatchDataset(data_dir="./data")
+    dataset = UnderwaterPatchDataset(data_dir="./datasets/dummy_dataset")
     sample = dataset[0]
     x_raw = sample['noisy_points']
     features = sample['features']

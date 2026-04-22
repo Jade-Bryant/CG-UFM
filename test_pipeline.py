@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 import torch.optim as optim
 import time
 
@@ -74,9 +75,19 @@ def main():
     # Step 5: 前向传播预测速度与存活率
     v_pred, alpha_pred = net(x_t, t, c_dense)
     
-    # Step 6: 计算 Loss
-    # 我们的 FlowMatchingLoss 内部期望 x_0 以计算真正的 target_velocity
-    loss, metrics = criterion(x_0, x_gt, v_pred, alpha_pred, t)
+    # Step 6: 计算 Loss (手动计算，复用已有的 OT 结果，避免重复计算)
+    v_target = matched_x_gt - x_0  # (B, M, 3) 线性流的恒定速度目标
+    mask = survival_target.expand_as(v_pred)  # (B, M, 3)
+    num_survivors = survival_target.sum().clamp(min=1.0)
+    loss_vel = F.mse_loss(v_pred * mask, v_target * mask, reduction='sum') / num_survivors
+    loss_surv = F.binary_cross_entropy_with_logits(alpha_pred, survival_target)
+    loss = criterion.lambda_vel * loss_vel + criterion.lambda_surv * loss_surv
+    metrics = {
+        "loss_total": loss.item(),
+        "loss_vel": loss_vel.item(),
+        "loss_surv": loss_surv.item(),
+        "survivor_ratio": (survival_target.sum() / (B * M)).item()
+    }
     
     # Step 7: 反向传播与梯度更新
     loss.backward()
