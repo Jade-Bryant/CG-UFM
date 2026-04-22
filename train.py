@@ -79,7 +79,7 @@ def main():
     wandb.init(project="CG-UFM", config={"learning_rate": lr, "epochs": epochs, "batch_size": batch_size})
     
     # Initialize Dataset & DataLoader
-    dataset = UnderwaterPatchDataset(data_dir="./data/dummy_dataset")
+    dataset = UnderwaterPatchDataset(data_dir="./datasets/dummy_dataset")
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
     
     # Initialize Model, Optimizer, Scheduler, Criterion

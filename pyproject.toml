@@ -14,13 +14,13 @@ authors = [
 ]
 
 dependencies = [
-    # Core deep learning framework
-    "torch>=2.0.0",
-    "torchvision>=0.15.0",
-    "torchaudio>=2.0.0",
+    # Core deep learning framework (Version specified in README.md)
+    "torch",
+    "torchvision",
+    "torchaudio",
 
     # Core math and physics solver
-    "torchdiffeq>=0.2.3",
+    "torchdiffeq",
     "POT>=0.9.3",
     "scipy>=1.10.0",
 

@@ -65,7 +65,7 @@ def generate_random_dummy_patch(num_gt=4096, num_raw=512, feature_dim=6):
 def main():
     print("🚀 [INIT] Starting RANDOMIZED Dummy Dataset Generation...")
     num_train_samples = 200  
-    save_dir = "./data/dummy_dataset"
+    save_dir = "./datasets/dummy_dataset"
     os.makedirs(save_dir, exist_ok=True)
     
     for i in tqdm(range(num_train_samples), desc="Generating Random Patches"):

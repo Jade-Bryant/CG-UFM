@@ -106,7 +106,6 @@ Thumbs.db
 # ---------------------------------------------------
 
 # Datasets and generated data
-data/dummy_dataset/
 !data/.gitkeep
 datasets/
 *.ply
