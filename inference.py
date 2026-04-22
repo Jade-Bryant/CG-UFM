@@ -2,10 +2,10 @@ import torch
 import numpy as np
 
 # Imports from CG_UFM modules
-from CG_UFM.data.dataset import UnderwaterPatchDataset
-from CG_UFM.models.cufm_net import CG_UFM_Network
-from CG_UFM.core.ode_solver import ODESolver
-from CG_UFM.core.aggregation import NadarayaWatsonAggregator
+from data.dataset import UnderwaterPatchDataset
+from models.cufm_net import CG_UFM_Network
+from core.ode_solver import ODESolver
+from core.aggregation import NadarayaWatsonAggregator
 
 def infer_patch(model, solver, x_raw, features, device):
     """

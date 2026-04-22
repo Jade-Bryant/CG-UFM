@@ -1,16 +1,15 @@
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import wandb
+import os
 
 # Imports from CG_UFM modules
-from CG_UFM.data.dataset import UnderwaterPatchDataset
-from CG_UFM.models.cufm_net import CG_UFM_Network
-from CG_UFM.core.flow_matching import FlowMatchingLoss
+from data.dataset import UnderwaterPatchDataset
+from models.cufm_net import CG_UFM_Network
+from core.flow_matching import FlowMatchingLoss
 
 def train_epoch(model, dataloader, optimizer, criterion, device):
-    """
-    Standard PyTorch training loop for one epoch.
-    """
     model.train()
     total_loss = 0.0
     
@@ -19,44 +18,49 @@ def train_epoch(model, dataloader, optimizer, criterion, device):
         
         # Load Data
         x_raw = batch['noisy_points'].to(device)   # (B, N, 3)
-        features = batch['features'].to(device)      # (B, N, D)
-        x_gt = batch['gt_points'].to(device)         # (B, K, 3)
+        features = batch['features'].to(device)    # (B, N, D)
+        x_gt = batch['gt_points'].to(device)       # (B, K, 3)
         
         # 1. Forward Pass: Features -> Consensus -> Densify
-        # c_i: (B, N, d)
         c_i = model.consensus_mlp(features)
-        
-        # x_0: (B, M, 3), c_dense: (B, M, d)
         x_0, c_dense = model.densifier(x_raw, c_i)
         
         # 2. Sample random time t in [0, 1)
         B, M, _ = x_0.shape
         t = torch.rand((B, 1), device=device)
         
-        # In Flow Matching, x_t is a linear interpolation between x_0 and x_gt.
-        # But here we don't have x_gt mapped point-to-point until OT is computed.
-        # A common practice in FM is to compute OT on x_0 and x_gt first,
-        # then construct x_t.
+        # --- FIX: Compute OT Target ONLY ONCE ---
         with torch.no_grad():
-            matched_x_gt, _ = criterion.compute_ot_assignment(x_0, x_gt)
+            matched_x_gt, survival_target = criterion.compute_ot_assignment(x_0, x_gt)
+            v_target = matched_x_gt - x_0 # Flow matching linear target velocity
             
-        # Linear Interpolation: x_t = (1 - t) * x_0 + t * matched_x_gt
+        # 3. Construct x_t via Linear Interpolation
         t_expanded = t.unsqueeze(-1).expand(-1, M, 3)
         x_t = (1 - t_expanded) * x_0 + t_expanded * matched_x_gt
         
-        # 3. Forward Pass: ODE Network
+        # 4. Forward Pass: ODE Network
         v_pred, alpha_pred = model(x_t, t, c_dense)
         
-        # 4. Loss Computation
-        loss, metrics = criterion(x_0, x_gt, v_pred, alpha_pred, t)
+        # 5. Explicit Loss Computation (Avoids double OT computation)
+        mask = survival_target.expand_as(v_pred)
+        num_survivors = survival_target.sum().clamp(min=1.0)
         
-        # 5. Backward Pass
+        loss_vel = F.mse_loss(v_pred * mask, v_target * mask, reduction='sum') / num_survivors
+        loss_surv = F.binary_cross_entropy_with_logits(alpha_pred, survival_target)
+        loss = criterion.lambda_vel * loss_vel + criterion.lambda_surv * loss_surv
+        
+        metrics = {
+            "loss_total": loss.item(),
+            "loss_vel": loss_vel.item(),
+            "loss_surv": loss_surv.item(),
+            "survivor_ratio": (survival_target.sum() / (B * M)).item()
+        }
+        
+        # 6. Backward Pass
         loss.backward()
         optimizer.step()
         
         total_loss += loss.item()
-        
-        # Log to wandb
         wandb.log(metrics)
         
         if batch_idx % 10 == 0:
@@ -65,37 +69,49 @@ def train_epoch(model, dataloader, optimizer, criterion, device):
     return total_loss / len(dataloader)
 
 def main():
-    # Setup hyperparameters
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    epochs = 10
+    epochs = 100 # 增加到真实训练长度
     batch_size = 8
     lr = 1e-4
+    save_dir = "./weights"
+    os.makedirs(save_dir, exist_ok=True)
     
-    # Initialize wandb
-    wandb.init(project="CG-UFM", config={
-        "learning_rate": lr,
-        "epochs": epochs,
-        "batch_size": batch_size
-    })
+    wandb.init(project="CG-UFM", config={"learning_rate": lr, "epochs": epochs, "batch_size": batch_size})
     
     # Initialize Dataset & DataLoader
-    # Assuming dummy data loading for now
-    dataset = UnderwaterPatchDataset(data_dir="./data")
+    dataset = UnderwaterPatchDataset(data_dir="./data/dummy_dataset")
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
     
-    # Initialize Model
+    # Initialize Model, Optimizer, Scheduler, Criterion
     model = CG_UFM_Network(feature_dim=6, c_dim=64, time_emb_dim=64, backbone_dim=256).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     
-    # Initialize Optimizer & Criterion
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    criterion = FlowMatchingLoss(lambda_vel=1.0, lambda_surv=1.0).to(device)
+    # --- ADDED: Cosine Annealing LR Scheduler ---
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+    criterion = FlowMatchingLoss(lambda_vel=1.0, lambda_surv=2.0).to(device)
     
     print(f"Starting training on {device}...")
+    best_loss = float('inf')
+    
     for epoch in range(epochs):
         print(f"--- Epoch {epoch+1}/{epochs} ---")
         avg_loss = train_epoch(model, dataloader, optimizer, criterion, device)
-        print(f"Epoch {epoch+1} Average Loss: {avg_loss:.4f}")
-        wandb.log({"epoch": epoch+1, "avg_loss": avg_loss})
+        
+        # Update learning rate
+        scheduler.step()
+        current_lr = scheduler.get_last_lr()[0]
+        
+        print(f"Epoch {epoch+1} Average Loss: {avg_loss:.4f} | LR: {current_lr:.6e}")
+        wandb.log({"epoch": epoch+1, "avg_loss": avg_loss, "lr": current_lr})
+        
+        # --- ADDED: Model Checkpointing ---
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            torch.save(model.state_dict(), os.path.join(save_dir, "best_model.pth"))
+            print("🌟 New best model saved!")
+            
+        # Save latest model every epoch
+        torch.save(model.state_dict(), os.path.join(save_dir, "latest_model.pth"))
 
 if __name__ == "__main__":
     main()
