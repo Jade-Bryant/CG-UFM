@@ -1,0 +1,3 @@
+Method,CD_mean,CD_std,CD_n,F-Score_mean,F-Score_std,F-Score_n,E_junc_mean,E_junc_std,E_junc_n,E_caliper_mean,E_caliper_std,E_caliper_n
+Baseline,0.009916,0.000322,2,0.010000,0.000000,2,,,0,,,0
+Ours,0.000599,0.000021,2,0.586667,0.028284,2,,,0,,,0
