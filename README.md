@@ -9,8 +9,8 @@ CG-UFM is a point cloud optimization network designed for underwater fine-framed
 We recommend using Conda to manage your environment. The project requires Python `>=3.10`.
 
 ```bash
-conda create -n cufm python=3.10
-conda activate cufm
+conda create -n corl python=3.10
+conda activate corl
 ```
 
 ### 1. Install PyTorch

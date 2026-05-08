@@ -86,8 +86,10 @@ dmypy.json
 # Cython debug symbols
 cython_debug/
 
-# IDEs and Editors
+# AI, IDEs and Editors
 CLAUDE.md
+.claude
+.codex
 .vscode/
 .idea/
 *.swp
@@ -109,6 +111,7 @@ Thumbs.db
 # Datasets and generated data
 !data/.gitkeep
 datasets/
+dataset_test/
 *.ply
 *.pcd
 *.obj
