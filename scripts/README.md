@@ -261,37 +261,125 @@ normalisation of both clouds.
 
 ---
 
-## 5. Training & inference
+## 5. Filtering background out of `x_0`
+
+Known-pose SfM is honest about *where* the points are, but LoFTR will
+happily latch onto the textured pool floor / wall behind the object and
+triangulate them too. Those points pollute the mass-killing gradient signal
+of the UFM survival head, so they need to go before training -- but only the
+**obviously far** ones. Near-object ghost mass should stay so the survival
+head has training signal for what it's actually meant to learn.
+
+```bash
+python scripts/filter_sfm_background.py dataset_test/result_known_pose
+# writes <workspace>/sparse_filtered/points3D.ply  (this is x_0)
+#        <workspace>/sparse_filtered/points3D_colored.ply  (green=kept, red=dropped)
+#        <workspace>/sparse_filtered/filter_stats.json
+```
+
+Knobs:
+- `--radius-factor 2.0` (default) — keep points within `K * object_bounding_radius`
+  of `object_center` (both read from `transforms.json`). Tighten to 1.5 for
+  a cleaner cloud at the cost of mass-head training signal; loosen to 2.5
+  to give the survival head more obvious "kill me" examples.
+- `--scene-dir PATH` — only needed if the workspace's most recent run log
+  cannot be parsed automatically.
+- `--min-points 512` — warns if the kept count drops below the dataset.py
+  x_0 target (which would force `random sampling-with-replacement` and
+  duplicate points in training).
+
+What this does **NOT** do, deliberately: density clustering, surface
+projection, mass redistribution. UFM's dual-head ODE is supposed to learn
+all of that. This script just trims the most obvious signal-drowning bulk.
+
+---
+
+## 6. Compose the training-ready `.pt`
+
+Stitches a filtered SfM cloud (`x_0`) and a CAD-PDS cloud (`x_1`) into a
+single `.pt` whose schema matches `generate_dummy_data.py` and
+`data/dataset.py`. Most importantly: re-applies the CAD's AABB normalize
+affine to the SfM cloud so `x_0` and `x_1` stay aligned post-normalization.
+
+```bash
+python scripts/ply_to_pt.py \
+    dataset_test/result_known_pose \
+    datasets/gt/Elbow_30deg_004.pt \
+    datasets/training/Elbow_30deg_004.pt
+```
+
+Output schema:
+```python
+{
+    "noisy_points": (M, 3) float32,   # filtered SfM cloud (post-normalize)
+    "features":     (M, 6) float32,   # per-point feature vector (default: random noise)
+    "gt_points":    (K, 3) float32,   # CAD-sampled cloud (post-normalize)
+}
+```
+
+Knobs:
+- `--features {random, zeros, rgb_pad6}` — default `random` matches the
+  dummy generator (so the model that's been trained on dummy still sees
+  the same feature distribution). `rgb_pad6` swaps in PLY colors padded
+  with zeros for later experiments where you want photometric signal in
+  the consensus head.
+- `--use-raw` — read `sparse/points3D.ply` instead of `sparse_filtered/`.
+  Skips background filtering; use only for debugging.
+- `--seed 0` — RNG for `--features random`; frozen at .pt write time, so
+  this only affects which exact noise lives in the file.
+
+`data/dataset.py` will FPS-down/upsample to 512 / 4096 at load time, so
+native point counts in the `.pt` can vary scene-to-scene as long as both
+are above target (the script warns when they aren't).
+
+For batch generation, just bash-loop:
+```bash
+for scene in datasets/sim_dataset/elbow/Elbow_30deg_*; do
+    name=$(basename "$scene")
+    python scripts/run_sfm_known_pose.py "$scene" "outputs/sfm/$name" --fresh
+    python scripts/filter_sfm_background.py "outputs/sfm/$name"
+    python scripts/cad_to_gt.py "$scene/$name.obj" datasets/gt/
+    python scripts/ply_to_pt.py "outputs/sfm/$name" \
+        "datasets/gt/$name.pt" "datasets/training/$name.pt"
+done
+```
+
+---
+
+## 7. Training & inference
 
 ```bash
 python train.py                     # logs to W&B, checkpoints under outputs/
 python inference.py                 # exports input/output .ply pairs for viewing
 ```
 
-Both scripts read from `datasets/dummy_dataset/` by default. Once steps 2–3 are
-running on real data, point the dataset config at `datasets/sfm/` and
-`datasets/gt/` instead.
+Both scripts read from `datasets/dummy_dataset/` by default. Point them at
+`datasets/training/` (the `ply_to_pt.py` output dir) for real data.
 
 ---
 
-## 6. Quick reference
+## 8. Quick reference
 
-| Script                       | Purpose                                  | Output                                           |
-| ---                          | ---                                      | ---                                              |
-| `generate_dummy_data.py`     | Synthetic broken cylinders               | `datasets/dummy_dataset/patch_*.pt`              |
-| `scripts/run_sfm.sh`         | COLMAP SIFT SfM                          | `<ws>/sparse/0/points3D.ply` + log              |
-| `scripts/run_sfm_hloc.py`    | LoFTR detector-free SfM (incremental)    | `<ws>/sparse/0/points3D.ply` + log              |
-| `scripts/run_sfm_known_pose.py` | Known-pose triangulation (Blender)    | `<ws>/sparse/points3D.ply` + log                |
-| `scripts/align_sfm_to_cad.py`| Sim(3) align SfM workspace to CAD frame  | `<ws>/sparse_aligned/points3D.ply` + log        |
-| `scripts/cad_to_gt.py`       | Poisson Disk sample CAD mesh             | `<out>/<mesh>.pt` + log                         |
+| Script                          | Purpose                                       | Output                                           |
+| ---                             | ---                                           | ---                                              |
+| `generate_dummy_data.py`        | Synthetic broken cylinders                    | `datasets/dummy_dataset/patch_*.pt`              |
+| `scripts/run_sfm.sh`            | COLMAP SIFT SfM                               | `<ws>/sparse/0/points3D.ply` + log               |
+| `scripts/run_sfm_hloc.py`       | LoFTR detector-free SfM (incremental mapper)  | `<ws>/sparse/0/points3D.ply` + log               |
+| `scripts/run_sfm_known_pose.py` | Known-pose triangulation (Blender)            | `<ws>/sparse/points3D.ply` + log                 |
+| `scripts/align_sfm_to_cad.py`   | Sim(3) align SfM workspace to CAD frame       | `<ws>/sparse_aligned/points3D.ply` + log         |
+| `scripts/filter_sfm_background.py` | Sphere-clip background out of x_0          | `<ws>/sparse_filtered/points3D.ply` + log        |
+| `scripts/cad_to_gt.py`          | Poisson Disk sample CAD mesh                  | `<out>/<mesh>.pt` + log                          |
+| `scripts/ply_to_pt.py`          | Merge filtered SfM + CAD GT into training .pt | `<out>/<scene>.pt` matching dataset.py schema    |
 
 ---
 
-## 7. TODO
+## 9. TODO
 
-- [ ] `scripts/ply_to_pt.py` — convert SfM `points3D.ply` into the same `.pt`
-      schema as the GT (key: `noisy_points`), including FPS down to 512.
+- [x] `scripts/ply_to_pt.py` — convert SfM `points3D.ply` into the dataset .pt
+      schema, applying CAD's normalize affine to keep x_0/x_1 aligned.
 - [x] `scripts/align_sfm_to_cad.py` — Sim(3) alignment using `transforms.json`,
       so `x_0` and `x_1` share a frame for training. (Plus `run_sfm_known_pose.py`
       for the Blender path that skips alignment entirely.)
 - [ ] Replace the CPU FPS in `cad_to_gt.py` with a CUDA implementation once N > 16k.
+- [ ] Real per-point features in `ply_to_pt.py` (track length, reproj error,
+      multi-view consistency) instead of the current random/RGB placeholder.
