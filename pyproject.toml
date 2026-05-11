@@ -21,7 +21,6 @@ dependencies = [
 
     # Core math and physics solver
     "torchdiffeq",
-    "POT>=0.9.3",
     "scipy>=1.10.0",
 
     # 3D geometry processor

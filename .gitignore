@@ -25,6 +25,7 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+third_party/
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
@@ -87,6 +88,7 @@ dmypy.json
 cython_debug/
 
 # AI, IDEs and Editors
+background.md
 CLAUDE.md
 .claude
 .codex
@@ -112,6 +114,23 @@ Thumbs.db
 !data/.gitkeep
 datasets/
 dataset_test/
+sim_dataset/
+# `outputs/` is split per-subdir rather than blanket-ignored: git won't
+# descend into a directory that's been excluded, which would break the
+# `!outputs/benchmark/...` re-includes below. Listing the heavy
+# auto-generated subdirs explicitly keeps the door open for tracking
+# paper-deliverable artefacts under outputs/benchmark/.
+outputs/sfm/
+outputs/gt/
+outputs/assembled/
+outputs/training/
+outputs/test_input/
+outputs/test_gt/
+outputs/results/
+outputs/weights/
+outputs/wandb/
+outputs/*.log
+outputs/split.json
 *.ply
 *.pcd
 *.obj
@@ -120,9 +139,21 @@ dataset_test/
 *.npy
 *.h5
 
+# Exceptions: benchmark artefacts (CSV / LaTeX) are paper deliverables.
+# These re-include rules only work because `outputs/` itself is NOT in the
+# ignore list above (we list its subdirs instead). The `!outputs/benchmark/`
+# line re-includes the directory; the file-pattern lines re-include the
+# specific artefacts we want tracked.
+!outputs/benchmark/
+!outputs/benchmark/*.csv
+!outputs/benchmark/*.tex
+!outputs/benchmark/*.md
+!outputs/benchmark/*.txt
+
 # Model Checkpoints and Weights
 checkpoints/
 models_saved/
+weights/
 *.pth
 *.pt
 *.ckpt

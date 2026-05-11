@@ -37,7 +37,15 @@ def main():
     
     # 1. Load Model
     model = CG_UFM_Network(feature_dim=6, c_dim=64, time_emb_dim=64, backbone_dim=256).to(device)
-    # model.load_state_dict(torch.load("best_model.pth"))
+    # Loading: try / except RuntimeError → friendly message about old PointNet2
+    # weights being incompatible after the PointTransformer+FiLM migration.
+    # ckpt = torch.load("best_model.pth")
+    # try:
+    #     model.load_state_dict(ckpt)
+    # except RuntimeError as e:
+    #     raise RuntimeError(
+    #         "Incompatible checkpoint — backbone migrated to PointTransformer+FiLM; retrain."
+    #     ) from e
     
     # 2. Initialize ODE Solver & Aggregator
     solver = ODESolver(method='euler', step_size=0.1)

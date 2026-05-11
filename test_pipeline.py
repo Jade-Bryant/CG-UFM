@@ -1,5 +1,4 @@
 import torch
-import torch.nn.functional as F
 import torch.optim as optim
 import time
 
@@ -58,59 +57,91 @@ def main():
     # Step 1: 抽取特征并进行几何空间致密化 (Soft Mass Injection)
     c_i = net.consensus_mlp(features)       # (B, N_raw, d)
     x_0, c_dense = densifier(x_raw, c_i)    # x_0: (B, M, 3), c_dense: (B, M, d)
-    
-    # Step 2: [核心流匹配逻辑] 预先算出目标点，用于构造轨迹
-    # 注意：计算 OT 时不需要梯度，这纯粹是为了找目标配对
+
+    # Step 2: 用 no_grad UOT 预算 matched_x_gt，构造 x_t 直线路径
     with torch.no_grad():
-        matched_x_gt, survival_target = criterion.compute_ot_assignment(x_0, x_gt)
-    
+        matched_x_gt, _, _, _ = criterion.compute_ot_assignment(x_0, x_gt)
+
     # Step 3: 随机采样时间步 t ~ U(0, 1)
     t = torch.rand(B, 1, device=device)
-    t_expanded = t.unsqueeze(-1).expand(-1, M, 1) # (B, M, 1) 用于广播插值
-    
-    # Step 4: 构造时间 t 刻的中间物理状态 x_t (Optimal Transport 直线路径)
-    # 公式：x_t = (1-t)*x_0 + t*x_1
+    t_expanded = t.unsqueeze(-1).expand(-1, M, 3)
     x_t = (1 - t_expanded) * x_0 + t_expanded * matched_x_gt
-    
-    # Step 5: 前向传播预测速度与存活率
+
+    # Step 4: 前向传播预测速度与存活率
     v_pred, alpha_pred = net(x_t, t, c_dense)
-    
-    # Step 6: 计算 Loss (手动计算，复用已有的 OT 结果，避免重复计算)
-    v_target = matched_x_gt - x_0  # (B, M, 3) 线性流的恒定速度目标
-    mask = survival_target.expand_as(v_pred)  # (B, M, 3)
-    num_survivors = survival_target.sum().clamp(min=1.0)
-    loss_vel = F.mse_loss(v_pred * mask, v_target * mask, reduction='sum') / num_survivors
-    loss_surv = F.binary_cross_entropy_with_logits(alpha_pred, survival_target)
-    loss = criterion.lambda_vel * loss_vel + criterion.lambda_surv * loss_surv
-    metrics = {
-        "loss_total": loss.item(),
-        "loss_vel": loss_vel.item(),
-        "loss_surv": loss_surv.item(),
-        "survivor_ratio": (survival_target.sum() / (B * M)).item()
-    }
-    
-    # Step 7: 反向传播与梯度更新
+
+    # Step 5: 调用 criterion (内部跑可微分 UOT 让 α 梯度回流)
+    loss, metrics = criterion(
+        x_0, x_gt, v_pred, alpha_pred, t,
+        matched_x_gt_precomputed=matched_x_gt,
+    )
+
+    # Step 6: 反向传播与梯度更新
     loss.backward()
     optimizer.step()
     
     end_time = time.time()
     
     # ==========================
-    # 📊 REPORTING
+    # 📊 REPORTING + ASSERTIONS
     # ==========================
     print("✅ [SUCCESS] Pipeline execution completed without crashing!")
     print(f"⏱️  [TIME] Single step took: {end_time - start_time:.4f} seconds")
     print("📉 [LOSS METRICS]")
     for k, v in metrics.items():
         print(f"   - {k}: {v:.4f}")
-        
-    # 检查梯度是否断裂
-    grad_norm = sum(p.grad.norm().item() for p in net.parameters() if p.grad is not None)
-    print(f"⚡ [GRADIENT] Total network gradient norm: {grad_norm:.4f}")
-    if grad_norm == 0:
-        print("❌ [WARNING] Gradient is ZERO! The computation graph is broken.")
-    else:
-        print("✔️ [OK] Gradients are actively flowing through the network.")
+
+    # ── A1. 4-tuple unpack contract on compute_ot_assignment ──
+    matched_check, surv_check, pi_check, cost_check = criterion.compute_ot_assignment(x_0, x_gt)
+    assert matched_check.shape == (B, M, 3)
+    assert surv_check.shape == (B, M, 1)
+    assert pi_check.shape == (B, M, N_gt)
+    assert cost_check.shape == (B, M, N_gt)
+    print("[OK] A1 compute_ot_assignment 4-tuple shapes")
+
+    # ── A2. Critical sub-modules must receive non-zero gradient ──
+    crit_modules = {
+        "consensus_mlp":            net.consensus_mlp,
+        "backbone.consensus_branch": net.backbone.consensus_branch,
+        "backbone.film_enc0":       net.backbone.film_enc0,
+        "backbone.film_enc1":       net.backbone.film_enc1,
+        "backbone.film_enc2":       net.backbone.film_enc2,
+        "survival_head":            net.survival_head,   # ← key: α flows through Sinkhorn
+        "velocity_head":            net.velocity_head,
+    }
+    for name, mod in crit_modules.items():
+        gn = sum(p.grad.norm().item() for p in mod.parameters() if p.grad is not None)
+        assert gn > 0, f"❌ {name} has zero gradient — {name} is detached from the graph!"
+        print(f"[OK] A2 grad flows into {name}: {gn:.4e}")
+
+    # ── A3. Survival ratio sanity (α should not collapse to ~0) ──
+    # We only check the lower bound here. The upper bound (e.g. < 0.95) would
+    # be the right check on real data with ghost points where good/bad sources
+    # must be discriminated, but this test uses uniform-random x_raw and x_gt:
+    # every source has a viable target neighbour by construction, so the OT
+    # plan saturates surv ≈ a everywhere and survivor_ratio → 1.0 is correct.
+    surv_mean = metrics["survivor_ratio"]
+    assert surv_mean > 0.02, (
+        f"❌ survivor_ratio={surv_mean:.3f} too low — α may be collapsing to -∞")
+    print(f"[OK] A3 survivor_ratio={surv_mean:.3f} above collapse threshold")
+
+    # ── A4. PointTransformer FiLM near-identity-at-init ──
+    # FiLM is initialized with small Gaussian (std=0.01) — not strict identity,
+    # but small enough that the FiLM-augmented network outputs a perturbed
+    # version of the un-FiLMed one. Strict identity would require zero-init,
+    # which would cut gradient flow into ConsensusMLP at step 0 (see FiLMLayer
+    # docstring).
+    from models.backbones.point_transformer import PointTransformer
+    set_seed(2026)
+    pt_with_film = PointTransformer(in_dim=3 + 64, out_dim=256, c_dim=64).to(device)
+    max_w = max(pt_with_film.film_enc0.proj.weight.abs().max().item(),
+                pt_with_film.film_enc1.proj.weight.abs().max().item(),
+                pt_with_film.film_enc2.proj.weight.abs().max().item())
+    assert max_w < 0.1, (
+        f"❌ FiLM proj weight not in small-init regime: max |w| = {max_w:.3f}")
+    print(f"[OK] A4 FiLM proj weights small at init: max |w| = {max_w:.4f}")
+
+    print("\n🎉 ALL ASSERTIONS PASSED")
 
 if __name__ == "__main__":
     main()

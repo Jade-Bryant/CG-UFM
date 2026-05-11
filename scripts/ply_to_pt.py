@@ -194,6 +194,12 @@ def main() -> int:
         "features":     feats,                                              # (M, dim)
         "gt_points":    gt_pts.contiguous(),                                # (K, 3)
     }
+    # Forward the CAD-derived per-scene physical diameter if cad_to_gt
+    # populated it. benchmark.py prefers this over the global --gt-diameter
+    # fallback, so E_caliper is computed against the actual scene's pipe
+    # size instead of a one-size-fits-all constant.
+    if "gt_diameter" in gt_data:
+        out["gt_diameter"] = float(gt_data["gt_diameter"])
     torch.save(out, out_pt)
     log.info("[write] merged .pt -> %s   (noisy=%d, features=%dx%d, gt=%d)",
              out_pt, len(sfm_pts), len(sfm_pts), args.feature_dim, len(gt_pts))

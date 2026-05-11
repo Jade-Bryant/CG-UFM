@@ -52,20 +52,27 @@ if str(_ROOT) not in sys.path:
 # Global constants
 # ─────────────────────────────────────────────────────────────────────────────
 
-METRICS: List[str] = ["CD", "F-Score", "E_junc", "E_caliper"]
+METRICS: List[str] = ["CD", "CD_norm", "F-Score@1%", "F-Score@2%", "F-Score@5%",
+                      "E_junc", "E_caliper"]
 
 # True  → smaller value is better  (used to pick the "best" cell to bold)
 LOWER_BETTER: Dict[str, bool] = {
-    "CD":         True,
-    "F-Score":    False,
-    "E_junc":     True,
-    "E_caliper":  True,
+    "CD":          True,
+    "CD_norm":     True,
+    "F-Score@1%":  False,
+    "F-Score@2%":  False,
+    "F-Score@5%":  False,
+    "E_junc":      True,
+    "E_caliper":   True,
 }
 
 # LaTeX column headers aligned with METRICS order
 _LATEX_HEADERS = [
     r"CD $(\downarrow)$",
-    r"F-Score $(\uparrow)$",
+    r"CD$_{\text{norm}}$ $(\downarrow)$",
+    r"F@1\% $(\uparrow)$",
+    r"F@2\% $(\uparrow)$",
+    r"F@5\% $(\uparrow)$",
     r"$E_{\text{junc}}$ $(\downarrow)$",
     r"$E_{\text{caliper}}$ $(\downarrow)$",
 ]
@@ -85,6 +92,30 @@ def _chamfer_distance(pred: np.ndarray, gt: np.ndarray) -> float:
     d_p2g, _  = tree_gt.query(pred, k=1)
     d_g2p, _  = tree_pred.query(gt,   k=1)
     return float(np.mean(d_p2g ** 2) + np.mean(d_g2p ** 2))
+
+
+def _normalize_to_unit_sphere(pred: np.ndarray, gt: np.ndarray
+                              ) -> Tuple[np.ndarray, np.ndarray, float]:
+    """Map both clouds into a GT-defined unit-radius bounding sphere.
+
+    Returns (pred_norm, gt_norm, diag) where diag is the original GT bbox
+    diagonal length (so callers can convert back to physical units).
+
+    Why this exists: the raw CD column mixes per-scene scales (diag ranges
+    from 1.75 to 2.46 across our test set), so CD_mean is hard to read —
+    a small CD on a large scene might still indicate worse reconstruction
+    than a larger CD on a tiny scene. Normalizing makes CD comparable.
+
+    We define the normalization from GT alone (not pred + gt jointly) so
+    that a degenerate prediction can't artificially shrink the metric by
+    deflating the joint bbox.
+    """
+    aabb_min = gt.min(axis=0)
+    aabb_max = gt.max(axis=0)
+    center = (aabb_min + aabb_max) / 2.0
+    diag = float(np.linalg.norm(aabb_max - aabb_min))
+    scale = max(diag / 2.0, 1e-9)
+    return (pred - center) / scale, (gt - center) / scale, diag
 
 
 def _fscore(pred: np.ndarray, gt: np.ndarray,
@@ -133,6 +164,17 @@ def _evaluate_pair_worker(args: tuple) -> dict:
     result: dict = {m: float("nan") for m in METRICS}
     result["sample"] = Path(pred_str).stem
 
+    # Per-scene physical diameter override. cad_to_gt writes a per-mesh
+    # diameter estimate into the .pt; stage_infer copies it next to the GT
+    # .ply as <stem>_diameter.npy. Falling back to the global --gt-diameter
+    # is fine for legacy GT dirs that don't have the sidecar.
+    diameter_sidecar = Path(gt_str).with_name(Path(gt_str).stem + "_diameter.npy")
+    if diameter_sidecar.exists():
+        try:
+            gt_diameter = float(np.load(str(diameter_sidecar)))
+        except Exception:
+            pass  # keep the CLI fallback if the file is corrupt
+
     try:
         gt_pcd   = o3d.io.read_point_cloud(gt_str)
         pred_pcd = o3d.io.read_point_cloud(pred_str)
@@ -145,29 +187,61 @@ def _evaluate_pair_worker(args: tuple) -> dict:
         pred_pts = np.asarray(pred_pcd.points,  dtype=np.float64)
 
         # ── Chamfer Distance ───────────────────────────────────────────────
+        # Raw CD (in the original CAD frame's units — depends on per-scene scale).
         result["CD"] = _chamfer_distance(pred_pts, gt_pts)
 
-        # ── F-Score ────────────────────────────────────────────────────────
-        result["F-Score"], _, _ = _fscore(pred_pts, gt_pts, tau=fscore_tau)
+        # Scale-invariant CD: both clouds normalized to a unit-radius sphere
+        # defined by GT, so CD_norm is comparable across categories.
+        pred_n, gt_n, gt_diag = _normalize_to_unit_sphere(pred_pts, gt_pts)
+        result["CD_norm"] = _chamfer_distance(pred_n, gt_n)
+
+        # ── F-Score @ multiple thresholds ──────────────────────────────────
+        # τ as % of GT bbox diag. 1% is the standard but very tight for
+        # long thin objects (a 2m pipe → τ=2cm); reporting 2% and 5% gives
+        # a more complete picture and matches how Pointr / PCN report.
+        # If --fscore-tau is provided we honor it for the canonical 1% slot
+        # (legacy behaviour) and skip the multi-tau breakdown.
+        if fscore_tau is not None:
+            result["F-Score@1%"], _, _ = _fscore(pred_pts, gt_pts, tau=fscore_tau)
+            # leave 2%/5% as NaN — caller chose to override
+        else:
+            for pct, key in [(0.01, "F-Score@1%"),
+                             (0.02, "F-Score@2%"),
+                             (0.05, "F-Score@5%")]:
+                tau_i = pct * gt_diag
+                result[key], _, _ = _fscore(pred_pts, gt_pts, tau=tau_i)
 
         # ── Topology metrics ───────────────────────────────────────────────
-        evaluator = TopologyEvaluator(physical_gt_diameter=gt_diameter)
-        search_r  = gt_diameter * 1.5
+        # New TopoEvaluator: voxel-skeleton-graph based. E_caliper compares
+        # pred-vs-GT radii at every skeleton node (catches over-smoothing);
+        # E_junc bipartite-matches junctions (catches branch hallucination /
+        # collapse). Skeleton + junctions are cached on disk as
+        # <stem>_skeleton.npz / <stem>_junctions.npy next to the GT .ply,
+        # so subsequent benchmark runs reuse them without re-extracting.
+        gt_path_p = Path(gt_str)
+        evaluator = TopologyEvaluator(
+            physical_gt_diameter=gt_diameter,
+            cache_dir=gt_path_p.parent,
+            stem=gt_path_p.stem,
+        )
+        # Build (or load from sidecar) the GT skeleton + junctions.
+        evaluator.build_or_load_gt_graph(gt_pcd, str(gt_path_p))
 
+        # If the legacy junction sidecar was explicitly provided, honour it
+        # (caller may have produced hand-curated junctions); otherwise the
+        # evaluator falls back to the freshly extracted/loaded ones.
+        gt_junctions_arg = None
         if junc_str is not None:
-            # Full topo evaluation: both E_junc and E_caliper
-            gt_junctions = np.load(junc_str)
-            topo = evaluator.evaluate(pred_pcd, gt_junctions)
-            e_junc    = topo["E_junc"]
-            e_caliper = topo["E_caliper"]
-            result["E_junc"]    = float(e_junc)    if np.isfinite(e_junc)    else float("nan")
-            result["E_caliper"] = float(e_caliper) if np.isfinite(e_caliper) else float("nan")
-        else:
-            # No junction annotation → only E_caliper is computable
-            est_diam = evaluator.estimate_local_diameter(pred_pcd, search_radius=search_r)
-            if np.isfinite(est_diam):
-                result["E_caliper"] = float(abs(est_diam - gt_diameter))
-            # E_junc remains NaN
+            try:
+                gt_junctions_arg = np.load(junc_str)
+            except Exception:
+                gt_junctions_arg = None  # silently fall through to auto-extracted
+
+        topo = evaluator.evaluate(pred_pcd, gt_junctions_arg, gt_pcd=gt_pcd)
+        e_junc    = topo["E_junc"]
+        e_caliper = topo["E_caliper"]
+        result["E_junc"]    = float(e_junc)    if np.isfinite(e_junc)    else float("nan")
+        result["E_caliper"] = float(e_caliper) if np.isfinite(e_caliper) else float("nan")
 
     except Exception as exc:  # never let one bad file crash the whole run
         warnings.warn(f"[WARN] {Path(pred_str).name}: {type(exc).__name__}: {exc}")

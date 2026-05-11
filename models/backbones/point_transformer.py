@@ -117,6 +117,8 @@ class TransitionDown(nn.Module):
         Returns:
             new_xyz:  (B, npoint, 3)
             new_feat: (B, npoint, out_dim)
+            fps_idx:  (B, npoint)  indices into the input (used by ConsensusBranch
+                      to gather c at the same scale)
         """
         fps_idx  = farthest_point_sample(xyz, self.npoint)                  # (B, npoint)
         new_xyz  = index_points(xyz,  fps_idx)                              # (B, npoint, 3)
@@ -128,7 +130,7 @@ class TransitionDown(nn.Module):
         B, S, K, C = grouped.shape
         new_feat = self.mlp(grouped.reshape(B * S * K, C))                  # (B*S*K, out_dim)
         new_feat = new_feat.reshape(B, S, K, -1).max(dim=2)[0]             # (B, npoint, out_dim)
-        return new_xyz, self.norm(new_feat)
+        return new_xyz, self.norm(new_feat), fps_idx
 
 
 # ──────────────────────── Transition Up ────────────────────────
@@ -172,6 +174,58 @@ class TransitionUp(nn.Module):
         return self.norm(self.fc(fused))                                    # (B, N, out_dim)
 
 
+# ──────────────────────── FiLM Modulation ────────────────────────
+
+class FiLMLayer(nn.Module):
+    """
+    Feature-wise Linear Modulation: f → (1 + γ(c)) * f + β(c).
+
+    Initialization choice: small Gaussian on weight, zero on bias.
+
+    A strict zero-init (W=0, b=0) would make ∂output/∂c = f·W_γᵀ + W_βᵀ = 0
+    at step 0, severing gradient flow from the loss back into ConsensusMLP
+    until FiLM weights wake up — bad for from-scratch training. Small-σ init
+    (γ ≈ 0.08·𝒩, β = 0) keeps the layer near-identity (≈10% perturbation)
+    while letting consensus_mlp receive a real gradient on the very first step.
+    """
+    def __init__(self, c_dim: int, feat_dim: int):
+        super().__init__()
+        self.proj = nn.Linear(c_dim, 2 * feat_dim)
+        nn.init.normal_(self.proj.weight, std=0.01)
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(self, feat: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        """
+        feat: (B, S, feat_dim)
+        c:    (B, S, c_dim)   — must be at the same spatial scale as feat
+        """
+        gamma, beta = self.proj(c).chunk(2, dim=-1)
+        return (1 + gamma) * feat + beta
+
+
+class ConsensusBranch(nn.Module):
+    """
+    Per-stage projections for the consensus tensor c.
+
+    The consensus is a static prior — there is no learned spatial downsampling
+    (that would conflict with the SfM-derived inductive bias). Spatial alignment
+    to encoder stages is done via FPS-index gather on the main path; this module
+    only handles the channel-dim projection from in_c_dim → encoder feature dim.
+    """
+    def __init__(self, in_c_dim: int, dims: tuple):
+        super().__init__()
+        d0, d1, d2 = dims
+        self.lin = nn.ModuleList([
+            nn.Linear(in_c_dim, d0),
+            nn.Linear(in_c_dim, d1),
+            nn.Linear(in_c_dim, d2),
+        ])
+
+    def project(self, c: torch.Tensor, level: int) -> torch.Tensor:
+        """c: (B, S, in_c_dim) → (B, S, d_level). S can be any scale."""
+        return self.lin[level](c)
+
+
 # ──────────────────────── Full Backbone ────────────────────────
 
 class PointTransformer(nn.Module):
@@ -184,26 +238,30 @@ class PointTransformer(nn.Module):
                               TransUp → PT₃ → TransUp → PT₄    (decoder)
       → head → (B, N, out_dim)
 
-    Compared to PointNet2:
-      - No ball-query radius sensitivity; robust to varying point cloud scales
-      - Vector self-attention captures richer local structure for fine geometry
-      - Slightly higher memory cost at full resolution due to N×N distance matrix
+    When `c_dim > 0`, the network accepts a separate consensus tensor c at
+    forward time and applies FiLM modulation after each encoder PT block,
+    using c gathered to the matching spatial scale via the FPS indices from
+    the main path. Decoder is left unmodulated by default — encoder injection
+    is sufficient and keeps parameter count modest.
     """
     def __init__(self, in_dim: int, out_dim: int = 256,
                  npoints: tuple = (512, 128),
                  dims:    tuple = (64, 128, 256),
                  k_attn:  int   = 16,
-                 k_down:  int   = 16):
+                 k_down:  int   = 16,
+                 c_dim:   int   = 0):
         """
         npoints: (npoint1, npoint2) centroids per TransitionDown stage
         dims:    (d0, d1, d2) feature channels at each encoder level
         k_attn:  k-NN size for PT self-attention (memory: O(B·N·k_attn))
         k_down:  k-NN size for TransitionDown grouping
+        c_dim:   channels of the consensus tensor; 0 disables FiLM
         """
         super().__init__()
         d0, d1, d2 = dims
+        self.c_dim = c_dim
 
-        # Stem: project in_dim → d0 (handles arbitrary in_dim including xyz+consensus+time)
+        # Stem: project in_dim → d0
         self.stem = nn.Sequential(nn.Linear(in_dim, d0), nn.LayerNorm(d0), nn.ReLU(True))
 
         # Encoder
@@ -222,31 +280,52 @@ class PointTransformer(nn.Module):
         # Output projection
         self.head = nn.Sequential(nn.Linear(d0, out_dim), nn.LayerNorm(out_dim))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Consensus injection (zero-cost when c_dim == 0)
+        if c_dim > 0:
+            self.consensus_branch = ConsensusBranch(c_dim, dims)
+            self.film_enc0 = FiLMLayer(d0, d0)
+            self.film_enc1 = FiLMLayer(d1, d1)
+            self.film_enc2 = FiLMLayer(d2, d2)
+
+    def forward(self, x: torch.Tensor, c: torch.Tensor = None) -> torch.Tensor:
         """
         x: (B, N, in_dim)  — first 3 dims must be xyz
+        c: (B, N, c_dim) or None
         Returns: (B, N, out_dim)
         """
+        if self.c_dim > 0:
+            assert c is not None and c.shape[-1] == self.c_dim, (
+                f"Expected c with last dim={self.c_dim}, got "
+                f"{None if c is None else c.shape}")
+
         xyz = x[:, :, :3]                                                   # (B, N, 3)
 
         # Stem + encoder level 0
         f0 = self.stem(x)                                                   # (B, N, d0)
         f0 = self.pt_enc0(xyz, f0)                                          # (B, N, d0)
+        if self.c_dim > 0:
+            f0 = self.film_enc0(f0, self.consensus_branch.project(c, 0))
 
-        # Encoder level 1
-        xyz1, f1 = self.td1(xyz, f0)                                        # (B, 512, d1)
-        f1 = self.pt_enc1(xyz1, f1)                                         # (B, 512, d1)
+        # Encoder level 1: down-sample, gather c via FPS index, modulate
+        xyz1, f1, fps_idx_1 = self.td1(xyz, f0)                             # (B, np0, d1)
+        f1 = self.pt_enc1(xyz1, f1)
+        if self.c_dim > 0:
+            c_at_np0 = index_points(c, fps_idx_1)                           # (B, np0, c_dim)
+            f1 = self.film_enc1(f1, self.consensus_branch.project(c_at_np0, 1))
 
         # Encoder level 2
-        xyz2, f2 = self.td2(xyz1, f1)                                       # (B, 128, d2)
-        f2 = self.pt_enc2(xyz2, f2)                                         # (B, 128, d2)
+        xyz2, f2, fps_idx_2 = self.td2(xyz1, f1)                            # (B, np1, d2)
+        f2 = self.pt_enc2(xyz2, f2)
+        if self.c_dim > 0:
+            c_at_np1 = index_points(c_at_np0, fps_idx_2)                    # (B, np1, c_dim)
+            f2 = self.film_enc2(f2, self.consensus_branch.project(c_at_np1, 2))
 
         # Decoder level 1: 128 → 512
-        f1_up = self.tu1(xyz1, xyz2, f1, f2)                                # (B, 512, d1)
-        f1_up = self.pt_dec1(xyz1, f1_up)                                   # (B, 512, d1)
+        f1_up = self.tu1(xyz1, xyz2, f1, f2)                                # (B, np0, d1)
+        f1_up = self.pt_dec1(xyz1, f1_up)
 
         # Decoder level 2: 512 → N
         f0_up = self.tu2(xyz, xyz1, f0, f1_up)                              # (B, N, d0)
-        f0_up = self.pt_dec2(xyz, f0_up)                                    # (B, N, d0)
+        f0_up = self.pt_dec2(xyz, f0_up)
 
         return self.head(f0_up)                                             # (B, N, out_dim)

@@ -7,12 +7,11 @@
   \caption{Quantitative comparison on underwater fine-framed structure reconstruction. Best results are \textbf{bolded}. F-Score threshold $\tau = 1\%$ of GT bounding-box diagonal.}
   \label{tab:quantitative}
   \setlength{\tabcolsep}{6pt}
-  \begin{tabular}{lcccc}
+  \begin{tabular}{lccccccc}
     \toprule
-    Method & CD $(\downarrow)$ & F-Score $(\uparrow)$ & $E_{\text{junc}}$ $(\downarrow)$ & $E_{\text{caliper}}$ $(\downarrow)$ \\
+    Method & CD $(\downarrow)$ & CD$_{\text{norm}}$ $(\downarrow)$ & F@1\% $(\uparrow)$ & F@2\% $(\uparrow)$ & F@5\% $(\uparrow)$ & $E_{\text{junc}}$ $(\downarrow)$ & $E_{\text{caliper}}$ $(\downarrow)$ \\
     \midrule
-    Baseline & 0.0099 & 0.0100 & — & — \\
-    Ours & \textbf{0.0006} & \textbf{0.5867} & — & — \\
+    Ours & \textbf{0.0517} & \textbf{0.0465} & \textbf{0.0429} & \textbf{0.1210} & \textbf{0.4946} & \textbf{1.4845} & \textbf{0.0557} \\
     \bottomrule
   \end{tabular}
 \end{table}

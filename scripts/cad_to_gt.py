@@ -40,6 +40,7 @@ from pathlib import Path
 import numpy as np
 import open3d as o3d
 import torch
+import trimesh
 
 
 def parse_args() -> argparse.Namespace:
@@ -94,7 +95,13 @@ def fps_indices(points: np.ndarray, n: int) -> np.ndarray:
 
 
 def sample_one(mesh_path: Path, n: int, oversample: float, max_faces: int) -> tuple[np.ndarray, np.ndarray]:
-    mesh = o3d.io.read_triangle_mesh(str(mesh_path))
+    # Use trimesh to load: it auto-triangulates N-gon faces (quads, 450-gons, etc.)
+    # that Open3D silently drops, which caused near-empty GT for T_joint / Y_joint.
+    tm = trimesh.load(str(mesh_path), force='mesh')
+    mesh = o3d.geometry.TriangleMesh(
+        o3d.utility.Vector3dVector(tm.vertices),
+        o3d.utility.Vector3iVector(tm.faces),
+    )
     if len(mesh.triangles) == 0:
         raise RuntimeError(f"Empty mesh: {mesh_path}")
 
@@ -136,6 +143,31 @@ def normalize(pts: np.ndarray, mode: str) -> tuple[np.ndarray, dict | None]:
     return (centered / scale).astype(np.float32), {"center": center.astype(np.float32), "scale": scale}
 
 
+def estimate_pipe_diameter(pts: np.ndarray) -> float:
+    """Estimate the local tube/pipe diameter from sampled surface points.
+
+    For pipe-shaped objects (elbow, reducer, straight_pipe, T-joint, Y-joint),
+    the AABB short axes ≈ the outer diameter — the long axis runs along the
+    pipe's main flow direction, and the two perpendicular axes both span the
+    cross-section. We use the *mean of the two shortest axis extents* as a
+    rough physical diameter estimate.
+
+    This is intentionally a per-scene scalar rather than a full diameter
+    field — E_caliper is designed as a single-number summary anyway. For
+    reducers (which change diameter along the length) this returns an
+    average; that's acceptable because E_caliper's purpose is to detect
+    over-smoothing collapse, not characterise variable cross-sections.
+
+    Returns the estimate in the *output* (post-normalize) coordinate frame,
+    so benchmark.py can directly compare it to estimate_local_diameter()
+    on the prediction without further bookkeeping.
+    """
+    aabb = pts.max(axis=0) - pts.min(axis=0)            # (3,)
+    sorted_extent = np.sort(aabb)                       # short → long
+    # Mean of the two short axes = mean cross-section span ≈ outer diameter.
+    return float((sorted_extent[0] + sorted_extent[1]) / 2.0)
+
+
 def main() -> int:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -167,11 +199,19 @@ def main() -> int:
         try:
             pts, nrm = sample_one(mesh_path, args.num_points, args.oversample, args.max_faces)
             pts, norm_meta = normalize(pts, args.normalize)
+            # Estimate per-scene physical diameter on the post-normalize cloud
+            # so benchmark.py's E_caliper compares apples to apples (the
+            # prediction is also written in normalized frame from stage_infer).
+            gt_diameter = estimate_pipe_diameter(pts)
             torch.save({
                 "gt_points": torch.from_numpy(pts),                   # (N, 3)
                 "gt_normals": torch.from_numpy(nrm),                  # (N, 3)
                 "mesh_name": mesh_path.stem,
                 "normalize": norm_meta,
+                # Per-scene pipe diameter — read by benchmark.py to replace
+                # the global --gt-diameter fallback. With this, E_caliper
+                # is no longer comparing to a globally-tuned constant.
+                "gt_diameter": float(gt_diameter),
             }, out_path)
             if not args.no_ply:
                 ply_path = out_path.with_suffix(".ply")

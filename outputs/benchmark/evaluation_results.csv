@@ -1,3 +1,2 @@
-Method,CD_mean,CD_std,CD_n,F-Score_mean,F-Score_std,F-Score_n,E_junc_mean,E_junc_std,E_junc_n,E_caliper_mean,E_caliper_std,E_caliper_n
-Baseline,0.009916,0.000322,2,0.010000,0.000000,2,,,0,,,0
-Ours,0.000599,0.000021,2,0.586667,0.028284,2,,,0,,,0
+Method,CD_mean,CD_std,CD_n,CD_norm_mean,CD_norm_std,CD_norm_n,F-Score@1%_mean,F-Score@1%_std,F-Score@1%_n,F-Score@2%_mean,F-Score@2%_std,F-Score@2%_n,F-Score@5%_mean,F-Score@5%_std,F-Score@5%_n,E_junc_mean,E_junc_std,E_junc_n,E_caliper_mean,E_caliper_std,E_caliper_n
+Ours,0.051671,0.041527,15,0.046544,0.034253,15,0.042912,0.042119,15,0.121006,0.112367,15,0.494613,0.221059,15,1.484504,1.535919,15,0.055659,0.027326,15
